@@ -1,21 +1,15 @@
 package com.reactnativecommunity.geolocation;
 
 import android.annotation.SuppressLint;
-import android.app.Activity;
-import android.location.Location;
 import android.os.Looper;
-import android.util.Log;
 import android.content.Context;
 import android.location.LocationManager;
-
-import androidx.annotation.NonNull;
 
 import com.facebook.react.bridge.Callback;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReadableMap;
-import com.facebook.react.bridge.WritableMap;
-import com.facebook.react.common.SystemClock;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
+import com.google.android.gms.location.CurrentLocationRequest;
 import com.google.android.gms.location.FusedLocationProviderClient;
 import com.google.android.gms.location.LocationAvailability;
 import com.google.android.gms.location.LocationCallback;
@@ -30,7 +24,6 @@ import com.google.android.gms.location.SettingsClient;
 public class PlayServicesLocationManager extends BaseLocationManager {
     private FusedLocationProviderClient mFusedLocationClient;
     private LocationCallback mLocationCallback;
-    private LocationCallback mSingleLocationCallback;
     private SettingsClient mLocationServicesSettingsClient;
 
     protected PlayServicesLocationManager(ReactApplicationContext reactContext) {
@@ -41,29 +34,41 @@ public class PlayServicesLocationManager extends BaseLocationManager {
 
     @Override
     public void getCurrentLocationData(ReadableMap options, Callback success, Callback error) {
-        AndroidLocationManager.LocationOptions locationOptions = AndroidLocationManager.LocationOptions.fromReactMap(options);
+        LocationOptions locationOptions = LocationOptions.fromReactMap(options);
+        fetchCurrentLocation(buildCurrentLocationRequest(locationOptions), success, error);
+    }
 
-        Activity currentActivity = mReactContext.getCurrentActivity();
-
-        if (currentActivity == null) {
-            mSingleLocationCallback = createSingleLocationCallback(success, error);
-            checkLocationSettings(options, mSingleLocationCallback, error);
-			return;
+    private CurrentLocationRequest buildCurrentLocationRequest(LocationOptions options) {
+        CurrentLocationRequest.Builder builder = new CurrentLocationRequest.Builder();
+        builder.setPriority(getPriority(options.highAccuracy));
+        if (!Double.isInfinite(options.maximumAge)) {
+            builder.setMaxUpdateAgeMillis((long) options.maximumAge);
         }
+        builder.setDurationMillis(options.timeout);
+        return builder.build();
+    }
 
-        try {
-            mFusedLocationClient.getLastLocation()
-                    .addOnSuccessListener(currentActivity, location -> {
-                        if (location != null && (SystemClock.currentTimeMillis() - location.getTime()) < locationOptions.maximumAge) {
-                            success.invoke(locationToMap(location));
-                        } else {
-                            mSingleLocationCallback = createSingleLocationCallback(success, error);
-                            checkLocationSettings(options, mSingleLocationCallback, error);
+    private void fetchCurrentLocation(CurrentLocationRequest request, Callback success, Callback error) {
+        mFusedLocationClient.getCurrentLocation(request, null)
+                .addOnSuccessListener(location -> {
+                    if (location == null) {
+                        if (!isAnyProviderAvailable()) {
+                            error.invoke(PositionError.buildError(PositionError.POSITION_UNAVAILABLE, "Location not available (FusedLocationProvider/settings)."));
+                            return;
                         }
-                    });
-        } catch (SecurityException e) {
-            throw e;
-        }
+                        error.invoke(PositionError.buildError(PositionError.TIMEOUT, "No location provided (FusedLocationProvider/currentLocation/null)."));
+                        return;
+                    }
+                    success.invoke(locationToMap(location));
+                })
+                .addOnFailureListener(e -> {
+                    if (e instanceof SecurityException) {
+                        error.invoke(PositionError.buildError(PositionError.PERMISSION_DENIED, "Location permission was not granted (FusedLocationProvider/currentLocation/denied)."));
+                        return;
+                    }
+                    error.invoke(PositionError.buildError(PositionError.POSITION_UNAVAILABLE, "Location not available (FusedLocationProvider/currentLocation/failure)."));
+                })
+                .addOnCanceledListener(() -> error.invoke(PositionError.buildError(PositionError.POSITION_UNAVAILABLE, "Location request cancelled (FusedLocationProvider/currentLocation/canceled).")));
     }
 
     @Override
@@ -102,13 +107,13 @@ public class PlayServicesLocationManager extends BaseLocationManager {
     private void checkLocationSettings(ReadableMap options, LocationCallback locationCallback, Callback error) {
         LocationOptions locationOptions = LocationOptions.fromReactMap(options);
         LocationRequest.Builder requestBuilder = new LocationRequest.Builder(locationOptions.interval);
-        requestBuilder.setPriority(locationOptions.highAccuracy ? Priority.PRIORITY_HIGH_ACCURACY : Priority.PRIORITY_LOW_POWER);
+        requestBuilder.setPriority(getPriority(locationOptions.highAccuracy));
         requestBuilder.setMaxUpdateAgeMillis((long) locationOptions.maximumAge);
 
         if (locationOptions.fastestInterval >= 0) {
             requestBuilder.setMinUpdateIntervalMillis(locationOptions.fastestInterval);
         }
-        
+
         if (locationOptions.distanceFilter >= 0) {
             requestBuilder.setMinUpdateDistanceMeters(locationOptions.distanceFilter);
         }
@@ -135,6 +140,10 @@ public class PlayServicesLocationManager extends BaseLocationManager {
                 });
     }
 
+    private static int getPriority(boolean highAccuracy) {
+        return highAccuracy ? Priority.PRIORITY_HIGH_ACCURACY : Priority.PRIORITY_LOW_POWER;
+    }
+
     private void requestLocationUpdates(LocationRequest locationRequest, LocationCallback locationCallback) {
         try {
             mFusedLocationClient.requestLocationUpdates(locationRequest, locationCallback, Looper.getMainLooper());
@@ -150,60 +159,5 @@ public class PlayServicesLocationManager extends BaseLocationManager {
         LocationManager locationManager =
                     (LocationManager) mReactContext.getSystemService(Context.LOCATION_SERVICE);
         return locationManager != null && (locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER) || locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER));
-    }
-
-    private LocationCallback createSingleLocationCallback(Callback success, Callback error) {
-        final CallbackHolder callbackHolder = new CallbackHolder(success, error);
-
-        return new LocationCallback() {
-            @Override
-            public void onLocationResult(@NonNull LocationResult locationResult) {
-                Location location = locationResult.getLastLocation();
-
-                if (location == null) {
-                    callbackHolder.error(PositionError.buildError(PositionError.POSITION_UNAVAILABLE, "No location provided (FusedLocationProvider/lastLocation)."));
-                    return;
-                }
-
-                callbackHolder.success(location);
-
-                mFusedLocationClient.removeLocationUpdates(mSingleLocationCallback);
-                mSingleLocationCallback = null;
-            }
-
-            @Override
-            public void onLocationAvailability(@NonNull LocationAvailability locationAvailability) {
-                if (!locationAvailability.isLocationAvailable()) {
-                    callbackHolder.error(PositionError.buildError(PositionError.POSITION_UNAVAILABLE, "Location not available (FusedLocationProvider/lastLocation)."));
-                }
-            }
-        };
-    }
-
-    private static class CallbackHolder {
-        Callback success;
-        Callback error;
-        public CallbackHolder(Callback success, Callback error) {
-            this.success = success;
-            this.error = error;
-        }
-
-        public void error(WritableMap cause) {
-            if (this.error == null) {
-                Log.e(this.getClass().getSimpleName(), "tried to invoke null error callback -> " + cause.toString());
-                return;
-            }
-            this.error.invoke(cause);
-            this.error = null;
-        }
-
-        public void success(Location location) {
-            if (this.success == null) {
-                Log.e(this.getClass().getSimpleName(), "tried to invoke null success callback");
-                return;
-            }
-            this.success.invoke(locationToMap(location));
-            this.success = null;
-        }
     }
 }
